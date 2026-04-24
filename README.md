@@ -11,7 +11,7 @@ design decisions, and tech stack for interview and review purposes.
 | # | Project | Repo | Status |
 |---|---|---|---|
 | 1 | [AWS VPC & IAM Infrastructure](#1-aws-vpc--iam-infrastructure) | [project_vpc_iam](https://github.com/Ajay0696/project_vpc_iam) (private) | Complete |
-| 2 | [EKS Platform (LB, DNS, S3)](#2-eks-platform-lb-dns-s3) | [project_app_infra](https://github.com/Ajay0696/project_app_infra) (private) | Planned |
+| 2 | [EKS Platform](#2-eks-platform) | [project_app_infra](https://github.com/Ajay0696/project_app_infra) (private) | In Progress |
 | 3 | [ArgoCD GitOps](#3-argocd-gitops) | TBD | Planned |
 | 4 | [Observability Stack (Loki, Fluent Bit, Thanos)](#4-observability-stack) | TBD | Planned |
 
@@ -84,32 +84,22 @@ zero when idle (min=0, max=3) and terminate after each job.
 **Multi-module workflow with per-environment state keys**
 All three workflows (plan/apply/destroy) have a module selector dropdown. Each root
 module has its own `providers.tf` with a unique state key following the convention
-`<resource>/<environment>/terraform.tfstate`:
-
-```
-vpc-iam-state-bucket/
-  vpc/mgmt/terraform.tfstate
-  vpc/prod/terraform.tfstate    (future)
-  iam/mgmt/terraform.tfstate    (future)
-```
+`<resource>/<environment>/terraform.tfstate`.
 
 ### Resources Provisioned
-
-**VPC (`mgmt_vpc_creation` module)**
 
 | Resource | Name |
 |---|---|
 | VPC | `prod-us-east-1-ajayshandbook-vpc` |
 | Internet Gateway | `prod-us-east-1-ajayshandbook-igw` |
-| Public Subnets (×2) | `prod-us-east-1-ajayshandbook-public-subnet-subnet-a/b` |
-| Private Subnets (×2) | `prod-us-east-1-ajayshandbook-private-subnet-subnet-a/b` |
+| Public Subnets (×2) | `prod-us-east-1-ajayshandbook-public-subnet-a/b` |
+| Private Subnets (×2) | `prod-us-east-1-ajayshandbook-private-subnet-a/b` |
 | Public Route Table | `prod-us-east-1-ajayshandbook-public-rt` |
 | Private Route Table | `prod-us-east-1-ajayshandbook-private-rt` |
-| NAT Gateway | `prod-us-east-1-ajayshandbook-nat-gw` |
-| NAT EIP | `prod-us-east-1-ajayshandbook-nat-eip` |
 
-**Network layout:** `10.0.0.0/16` VPC, public subnets in `us-east-1a/b`, private subnets
-in `us-east-1a/b` (disabled by default, toggled via `create_private_subnets` variable).
+**Network layout:** `10.0.0.0/16` VPC, public and private subnets in `us-east-1a/b`.
+Private subnets and NAT gateway are toggled via `create_private_subnets` variable
+(disabled by default to avoid NAT costs during practice).
 
 ### CI/CD Workflows
 
@@ -121,17 +111,119 @@ in `us-east-1a/b` (disabled by default, toggled via `create_private_subnets` var
 
 ---
 
-## 2. EKS Platform (LB, DNS, S3)
+## 2. EKS Platform
 
-*Coming soon*
+Provisions a production-pattern EKS cluster on AWS using raw Terraform resources
+(no community module). Includes node pools for ingress and platform workloads,
+Karpenter for dynamic scaling of developer workloads, and Calico for CNI.
 
 **Repo:** [github.com/Ajay0696/project_app_infra](https://github.com/Ajay0696/project_app_infra) (private)
 
-Planned scope:
-- EKS cluster provisioned via Terraform
-- AWS Load Balancer Controller
-- ExternalDNS with Route53
-- S3 buckets for application storage
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Local Machine (k3d cluster)                            │
+│                                                         │
+│  ┌─────────────────┐     ┌──────────────────────────┐  │
+│  │  ARC Controller │────▶│  Runner Pod (ephemeral)   │  │
+│  │  (watches GH)   │     │  - Terraform pre-installed│  │
+│  └─────────────────┘     └────────────┬─────────────┘  │
+└───────────────────────────────────────┼─────────────────┘
+                                        │ GitHub OIDC → AWS STS
+                                        ▼
+                    ┌───────────────────────────────────┐
+                    │  AWS EKS (mgmt cluster)           │
+                    │                                   │
+                    │  ┌─────────────┐  ┌───────────┐  │
+                    │  │ traefikext  │  │ traefikint│  │
+                    │  │ t3a.small   │  │ t3a.small │  │
+                    │  │ spot        │  │ spot      │  │
+                    │  └─────────────┘  └───────────┘  │
+                    │                                   │
+                    │  ┌──────────────────────────────┐ │
+                    │  │ clusterworkloads              │ │
+                    │  │ t3a.medium × 2 (spot)        │ │
+                    │  │ Loki · Grafana · Prometheus  │ │
+                    │  │ Karpenter controller         │ │
+                    │  └──────────────────────────────┘ │
+                    │                                   │
+                    │  ┌──────────────────────────────┐ │
+                    │  │ Karpenter-managed nodes       │ │
+                    │  │ (dynamically provisioned for  │ │
+                    │  │  developer workloads)         │ │
+                    │  └──────────────────────────────┘ │
+                    └───────────────────────────────────┘
+```
+
+### Tech Stack
+
+| Component | Technology |
+|---|---|
+| Infrastructure as Code | Terraform (~> 6.0 AWS provider) |
+| State Backend | S3 (`use_lockfile = true`, no DynamoDB) |
+| Kubernetes | EKS 1.33 (managed control plane) |
+| CNI | Calico (overlay network, no ENI pod density limits) |
+| Node Autoscaler | Karpenter v1.x |
+| Pod IAM | EKS Pod Identity (replaces IRSA — no OIDC provider needed) |
+| Node Capacity | Spot instances throughout (cost optimisation) |
+| Instance Type | t3a (AMD — ~10% cheaper than Intel t3 equivalent) |
+| CI/CD | GitHub Actions on `arc-runner-set-app-infra` (ARC on k3d) |
+
+### Key Design Decisions
+
+**Calico instead of VPC CNI**
+VPC CNI assigns real VPC IPs to pods, limited by ENI secondary IP capacity per instance
+(e.g. 17 pods max on `t3a.medium`). Calico uses an overlay network so pod density is
+limited only by CPU/memory — essential for running many small developer workloads.
+
+**EKS Pod Identity instead of IRSA**
+IRSA requires creating an IAM OIDC provider and encoding the cluster OIDC URL into every
+role's trust policy. Pod Identity uses a simpler trust policy
+(`Principal: pods.eks.amazonaws.com`) and an `aws_eks_pod_identity_association` resource
+to bind a role to a service account. No OIDC provider needed; roles can be reused across
+clusters.
+
+**Dedicated node pools with taints**
+Each node pool has a `node-role=<name>:NoSchedule` taint. Workloads must explicitly
+tolerate the taint to land on the pool. This guarantees:
+- Traefik pods never compete with platform workloads for resources
+- Platform workloads (Loki, Grafana, Karpenter controller) are isolated from external traffic
+
+**Karpenter for developer workload scaling**
+Managed node groups handle the fixed platform layer (min=1, max=2/3). Karpenter
+handles the unpredictable developer workloads, provisioning and deprovisioning nodes
+on demand to optimise cost.
+
+**Spot instances throughout**
+All managed node groups use SPOT capacity. For the practice cluster, interruption
+handling (SQS + EventBridge) is omitted to reduce cost — acceptable because pod
+disruption on spot reclaim is tolerable in a non-production environment.
+
+### Node Pools
+
+| Pool | Instance | Spot | Desired | Purpose |
+|---|---|---|---|---|
+| `traefikexternal` | t3a.small | Yes | 1 | Internet-facing Traefik |
+| `traefikinternal` | t3a.small | Yes | 1 | Internal Traefik |
+| `clusterworkloads` | t3a.medium | Yes | 2 | Loki, Grafana, Prometheus, Karpenter |
+
+### EKS Addons
+
+| Addon | Purpose |
+|---|---|
+| `kube-proxy` | Service iptables routing |
+| `coredns` | In-cluster DNS |
+| `aws-ebs-csi-driver` | EBS PersistentVolumes |
+| `eks-pod-identity-agent` | Delivers AWS credentials to pods via Pod Identity |
+
+### CI/CD Workflows
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| Terraform Plan | Manual | Init → fmt check → validate → plan, uploads artifact |
+| Terraform Apply | Manual | Init → apply |
+| Terraform Destroy | Manual (requires typing `destroy` to confirm) | Init → destroy |
 
 ---
 
