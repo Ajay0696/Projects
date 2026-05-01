@@ -20,35 +20,48 @@ design decisions, and tech stack for interview and review purposes.
 ## 1. AWS VPC & IAM Infrastructure
 
 Provisions the base network and IAM foundation on AWS using Terraform, with a fully
-automated CI/CD pipeline running on a local Kubernetes cluster.
+automated CI/CD pipeline running on ephemeral ECS Fargate runners.
 
 **Repo:** [github.com/Ajay0696/project_vpc_iam](https://github.com/Ajay0696/project_vpc_iam) (private)
 
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Local Machine (k3d cluster)                            │
-│                                                         │
-│  ┌─────────────────┐     ┌──────────────────────────┐  │
-│  │  ARC Controller │────▶│  Runner Pod (ephemeral)   │  │
-│  │  (watches GH)   │     │  - Terraform pre-installed│  │
-│  └─────────────────┘     └────────────┬─────────────┘  │
-└───────────────────────────────────────┼─────────────────┘
-                                        │ GitHub OIDC token
-                                        ▼
-                              ┌──────────────────┐
-                              │   AWS STS        │
-                              │  (verify token,  │
-                              │  return creds)   │
-                              └────────┬─────────┘
-                                       │ Temporary credentials (1hr)
-                                       ▼
-                              ┌──────────────────┐
-                              │   AWS            │
-                              │  VPC, Subnets,   │
-                              │  IGW, Route Tables│
-                              └──────────────────┘
+GitHub Actions
+  workflow_job.queued
+        │
+        ▼
+  API Gateway (HTTP)
+        │
+        ▼
+  Lambda (Python)
+  - Validates HMAC signature
+  - Gets runner registration token via Fine-Grained PAT
+  - Calls ecs:RunTask with token injected as env var
+        │
+        ▼
+┌───────────────────────────────────────┐
+│  Runner VPC (10.1.0.0/16)  CloudFormation-managed  │
+│                                       │
+│  ECS Fargate Task (ephemeral runner)  │
+│  - Registers with GitHub              │
+│  - Runs Terraform job                 │
+│  - Exits and deregisters              │
+└───────────────┬───────────────────────┘
+                │ GitHub OIDC token
+                ▼
+      ┌──────────────────┐
+      │   AWS STS        │
+      │  (verify token,  │
+      │  return creds)   │
+      └────────┬─────────┘
+               │ Temporary credentials (1hr)
+               ▼
+      ┌──────────────────┐
+      │   AWS            │
+      │  VPC, Subnets,   │
+      │  IGW, Route Tables│
+      └──────────────────┘
 ```
 
 ### Tech Stack
@@ -59,27 +72,36 @@ automated CI/CD pipeline running on a local Kubernetes cluster.
 | State Backend | S3 (`use_lockfile = true`, no DynamoDB) |
 | Bootstrap | AWS CloudFormation |
 | CI/CD | GitHub Actions (manual `workflow_dispatch`) |
-| Self-hosted Runners | Actions Runner Controller (ARC) on k3d |
+| Self-hosted Runners | ECS Fargate (ephemeral, `runs-on: ecs-runner`) |
+| Runner Trigger | API Gateway + Lambda (`workflow_job.queued` webhook) |
+| Runner Image | Public GHCR (`ghcr.io/ajay0696/terraform-runner:latest`) |
+| Credentials Storage | SSM Parameter Store SecureString (free tier) |
 | AWS Authentication | GitHub OIDC (no stored credentials) |
-| Runner Auth to GitHub | GitHub App (production standard over PAT) |
+| Runner Auth to GitHub | Fine-Grained PAT (runner registration token API) |
 
 ### Key Design Decisions
 
-**Chicken-egg problem for S3 state backend**
-Terraform needs an S3 bucket to store state, but it can't create the bucket without
-state. Solved by using CloudFormation to bootstrap the S3 buckets — CloudFormation has
-no remote backend dependency.
+**Chicken-egg bootstrap problem — two-VPC design**
+Terraform needs an S3 bucket and runners to run, but runners need infrastructure.
+Solved with two separate VPCs, both free at rest:
+- **Runner VPC** (`10.1.0.0/16`) — CloudFormation-managed, no Terraform dependency.
+  ECS Fargate runner tasks live here and can bootstrap the account from day one.
+- **EKS VPC** (`10.0.0.0/16`) — Terraform-managed, created after runners are working.
 
 **GitHub OIDC instead of stored AWS credentials**
-Runner pods never hold long-lived AWS credentials. GitHub issues a short-lived OIDC
-token to each job; AWS STS verifies it against the registered OIDC provider and returns
-temporary credentials (1hr TTL). If the cluster is compromised, there are no credentials
-to steal.
+Runner containers never hold long-lived AWS credentials. GitHub issues a short-lived
+OIDC token per job; AWS STS verifies it against the registered OIDC provider and returns
+temporary credentials (1hr TTL).
 
-**ARC on local k3d instead of EC2**
-Using EC2 runners would require the VPC to exist first — another chicken-egg problem.
-Running ARC on a local k3d cluster removes that dependency entirely. Runners scale to
-zero when idle (min=0, max=3) and terminate after each job.
+**ECS Fargate instead of EC2 or k3d/ARC**
+Fargate runners start in ~30–60s with zero idle cost. No EC2 instances to manage,
+no local cluster required, no AMI maintenance. The runner image (Ubuntu + Terraform
+binary) is hosted on GHCR as a public image — no ECR storage cost.
+
+**SSM Parameter Store over Secrets Manager**
+Webhook HMAC secret and GitHub PAT are stored as SSM SecureString parameters (free
+Standard tier). Secrets Manager would cost $0.40/secret/month — unnecessary for a
+practice account.
 
 **Multi-module workflow with per-environment state keys**
 All three workflows (plan/apply/destroy) have a module selector dropdown. Each root
@@ -90,14 +112,14 @@ module has its own `providers.tf` with a unique state key following the conventi
 
 | Resource | Name |
 |---|---|
-| VPC | `prod-us-east-1-ajayshandbook-vpc` |
-| Internet Gateway | `prod-us-east-1-ajayshandbook-igw` |
-| Public Subnets (×2) | `prod-us-east-1-ajayshandbook-public-subnet-a/b` |
-| Private Subnets (×2) | `prod-us-east-1-ajayshandbook-private-subnet-a/b` |
-| Public Route Table | `prod-us-east-1-ajayshandbook-public-rt` |
-| Private Route Table | `prod-us-east-1-ajayshandbook-private-rt` |
+| VPC | `prod-us-east-2-ajayshandbook-vpc` |
+| Internet Gateway | `prod-us-east-2-ajayshandbook-igw` |
+| Public Subnets (×2) | `prod-us-east-2-ajayshandbook-public-subnet-a/b` |
+| Private Subnets (×2) | `prod-us-east-2-ajayshandbook-private-subnet-a/b` |
+| Public Route Table | `prod-us-east-2-ajayshandbook-public-rt` |
+| Private Route Table | `prod-us-east-2-ajayshandbook-private-rt` |
 
-**Network layout:** `10.0.0.0/16` VPC, public and private subnets in `us-east-1a/b`.
+**Network layout:** `10.0.0.0/16` VPC, public and private subnets in `us-east-2a/b`.
 Private subnets and NAT gateway are toggled via `create_private_subnets` variable
 (disabled by default to avoid NAT costs during practice).
 
@@ -122,16 +144,12 @@ Karpenter for dynamic scaling of developer workloads, and Calico for CNI.
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Local Machine (k3d cluster)                            │
-│                                                         │
-│  ┌─────────────────┐     ┌──────────────────────────┐  │
-│  │  ARC Controller │────▶│  Runner Pod (ephemeral)   │  │
-│  │  (watches GH)   │     │  - Terraform pre-installed│  │
-│  └─────────────────┘     └────────────┬─────────────┘  │
-└───────────────────────────────────────┼─────────────────┘
-                                        │ GitHub OIDC → AWS STS
-                                        ▼
+GitHub Actions (workflow_job.queued webhook)
+        │
+        ▼
+API Gateway → Lambda → ECS Fargate runner (ecs-runner label)
+        │ GitHub OIDC → AWS STS
+        ▼
                     ┌───────────────────────────────────┐
                     │  AWS EKS (mgmt cluster)           │
                     │                                   │
@@ -168,7 +186,7 @@ Karpenter for dynamic scaling of developer workloads, and Calico for CNI.
 | Pod IAM | EKS Pod Identity (replaces IRSA — no OIDC provider needed) |
 | Node Capacity | Spot instances throughout (cost optimisation) |
 | Instance Type | t3a (AMD — ~10% cheaper than Intel t3 equivalent) |
-| CI/CD | GitHub Actions on `arc-runner-set-app-infra` (ARC on k3d) |
+| CI/CD | GitHub Actions on ECS Fargate (`runs-on: ecs-runner`) |
 
 ### Key Design Decisions
 
